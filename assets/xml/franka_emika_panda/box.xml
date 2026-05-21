@@ -1,0 +1,9 @@
+<mujoco>
+  <worldbody>
+    <body name="cuboid" pos="0 0 0">
+      <freejoint/>
+      <inertial mass="0.035" pos="0 0 0" diaginertia="9.6354e-5 9.6354e-5 5.2083e-6"/>
+      <geom type="box" size="0.0125 0.0125 0.075" friction="0.75 0.005 0.0001"/>
+    </body>
+  </worldbody>
+</mujoco>
