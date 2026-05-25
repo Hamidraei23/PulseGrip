@@ -1,22 +1,19 @@
 """
-Step 3 — Real-time force estimation from one or more TMAG5273 sensors.
 
-Loads one calibration model per sensor (saved by 02_train_model.py) and
-streams calibrated force vectors. No ATI needed during experiments.
 
 Single sensor
 -------------
-    python 03_run_experiment.py --port COM3 --models model_s1.pkl --rezero
+    python 03_run_experiment.py --port COM10 --models model_s1.pkl --rezero
 
 Two sensors
 -----------
-    python 03_run_experiment.py --port COM3 --n-sensors 2 \
+    python 03_run_experiment.py --port COM10 --n-sensors 2 \
         --models model_s1.pkl model_s2.pkl --rezero
 
 Output CSV columns (2 sensors, Fx/Fy/Fz per sensor):
     timestamp_s,
-    Bx_s1_mT, By_s1_mT, Bz_s1_mT, Fx_s1_N, Fy_s1_N, Fz_s1_N,
-    Bx_s2_mT, By_s2_mT, Bz_s2_mT, Fx_s2_N, Fy_s2_N, Fz_s2_N
+    Fx_s1_N, Fy_s1_N, Fz_s1_N,
+    Fx_s2_N, Fy_s2_N, Fz_s2_N
 
 Output file is auto-named experiment_YYYYMMDD_HHMMSS.csv so it never
 overwrites a previous session. Override with --output.
@@ -31,11 +28,13 @@ import argparse
 import csv
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import joblib
+import matplotlib.pyplot as plt
 
 from sensors import TMAG5273
 
@@ -55,10 +54,108 @@ def _build_csv_columns(n_sensors: int, models: list[dict]) -> list[str]:
     cols = ["timestamp_s"]
     for i, m in enumerate(models):
         sid = i + 1
-        cols += [f"Bx_s{sid}_mT", f"By_s{sid}_mT", f"Bz_s{sid}_mT"]
         cols += [f"{lbl}_s{sid}" for lbl in m.get("axis_labels", ["Fx_N", "Fy_N", "Fz_N"])]
     return cols
 
+
+# ── Live force display ─────────────────────────────────────────────────────────
+
+class LiveForceDisplay:
+    """
+    One subplot per sensor, each showing Fx, Fy, Fz over time.
+    Closing the window sets stop_requested = True.
+    """
+
+    COLORS = {"Fx": "tab:green", "Fy": "tab:purple", "Fz": "tab:blue"}
+
+    def __init__(self, n_sensors: int, models: list[dict], max_points: int = 400,
+                 update_interval_ms: float = 50):
+        self.n_sensors = n_sensors
+        self.models = models
+        self.max_points = max_points
+        self.update_interval_ms = update_interval_ms
+        self.stop_requested = False
+        self._window_open = True
+        self._last_draw = time.time()
+
+        # one deque per sensor per axis
+        self.t_buf = deque(maxlen=max_points)
+        self.f_bufs = []   # list[n_sensors] of dict{label: deque}
+        for m in models:
+            lbls = m.get("axis_labels", ["Fx_N", "Fy_N", "Fz_N"])
+            self.f_bufs.append({lbl: deque(maxlen=max_points) for lbl in lbls})
+
+        plt.ion()
+        self.fig, axes = plt.subplots(
+            n_sensors, 1,
+            figsize=(10, 4 * n_sensors),
+            sharex=True,
+            squeeze=False,
+        )
+        self.axes = [axes[i][0] for i in range(n_sensors)]
+        self.fig.suptitle("Real-time Force Estimation", fontsize=13, fontweight="bold")
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+
+        self.lines = []   # list[n_sensors] of dict{label: Line2D}
+        for i, (ax, m) in enumerate(zip(self.axes, models)):
+            lbls = m.get("axis_labels", ["Fx_N", "Fy_N", "Fz_N"])
+            sensor_lines = {}
+            for lbl in lbls:
+                axis_key = lbl.split("_")[0]   # "Fx", "Fy", "Fz"
+                color = self.COLORS.get(axis_key, "tab:gray")
+                line, = ax.plot([], [], color=color, linewidth=1.5, label=lbl)
+                sensor_lines[lbl] = line
+            self.lines.append(sensor_lines)
+
+            ax.set_title(f"Sensor {i + 1}", fontsize=10)
+            ax.set_ylabel("Force (N)")
+            ax.set_ylim(-15, 25)
+            ax.axhline(0, color="k", linewidth=0.5)
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.3)
+
+        self.axes[-1].set_xlabel("Time (s)")
+        plt.tight_layout()
+
+    def _on_close(self, _event):
+        self._window_open = False
+        self.stop_requested = True
+        print("\n# Plot window closed — stopping.", file=sys.stderr)
+
+    def update(self, elapsed: float, forces_per_sensor: list[np.ndarray]):
+        """Call once per loop iteration. forces_per_sensor[i] is a 1-D array of force values."""
+        self.t_buf.append(elapsed)
+        for i, f_vec in enumerate(forces_per_sensor):
+            lbls = self.models[i].get("axis_labels", ["Fx_N", "Fy_N", "Fz_N"])
+            for lbl, val in zip(lbls, f_vec):
+                self.f_bufs[i][lbl].append(val)
+
+        now = time.time()
+        if (now - self._last_draw) * 1000 >= self.update_interval_ms:
+            self._redraw()
+            self._last_draw = now
+
+    def _redraw(self):
+        if not self._window_open:
+            return
+        try:
+            t = list(self.t_buf)
+            for i, (ax, sensor_lines) in enumerate(zip(self.axes, self.lines)):
+                for lbl, line in sensor_lines.items():
+                    line.set_data(t, list(self.f_bufs[i][lbl]))
+                if len(t) > 1:
+                    ax.set_xlim(min(t), max(t))
+            self.fig.canvas.flush_events()
+        except Exception:
+            self._window_open = False
+
+    def close(self):
+        if self._window_open:
+            plt.ioff()
+            plt.close(self.fig)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -79,6 +176,8 @@ def main():
                         help="Stop after this many seconds (default: run until Ctrl-C)")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output CSV path (default: experiment_YYYYMMDD_HHMMSS.csv)")
+    parser.add_argument("--live-plot", action="store_true",
+                        help="Show a live Fx/Fy/Fz plot while streaming")
 
     hw = parser.add_argument_group("TMAG5273 (via ESP32 serial)")
     hw.add_argument("--port", required=True,
@@ -140,9 +239,34 @@ def main():
             print(f"# Sensor {i+1} using saved zero-field: {zero_fields[i]} mT", file=sys.stderr)
 
     # ------------------------------------------------------------------
+    # Force offset correction — predict forces at rest and subtract baseline
+    # This cancels any residual offset the model outputs at ΔB = 0.
+    # Always runs (regardless of --rezero) to handle model bias.
+    # ------------------------------------------------------------------
+    print("# Measuring force offset at rest — keep sensors unloaded…", file=sys.stderr)
+    force_offsets = [np.zeros(len(models[i].get("axis_labels", ["Fx_N", "Fy_N", "Fz_N"])))
+                     for i in range(n_sensors)]
+    offset_samples = [[] for _ in range(n_sensors)]
+    for _ in range(50):
+        reading = sensor.read_field_mT()
+        for i in range(n_sensors):
+            b  = reading if n_sensors == 1 else reading[i]
+            db = (b - zero_fields[i]).reshape(1, -1)
+            f  = models[i]["model"].predict(db).flatten()
+            offset_samples[i].append(f)
+    for i in range(n_sensors):
+        force_offsets[i] = np.array(offset_samples[i]).mean(axis=0)
+        print(f"#   Sensor {i+1} force offset: {force_offsets[i].round(4)} N", file=sys.stderr)
+
+    # ------------------------------------------------------------------
     # Build CSV structure
     # ------------------------------------------------------------------
     csv_columns = _build_csv_columns(n_sensors, models)
+
+    # ------------------------------------------------------------------
+    # Live plot (optional)
+    # ------------------------------------------------------------------
+    display = LiveForceDisplay(n_sensors, models) if args.live_plot else None
 
     # ------------------------------------------------------------------
     # Stream
@@ -164,21 +288,25 @@ def main():
                 elapsed = t0 - t_start
 
                 row = {"timestamp_s": f"{elapsed:.5f}"}
+                forces_per_sensor = []
 
                 for i in range(n_sensors):
                     sid = i + 1
                     b   = reading if n_sensors == 1 else reading[i]
                     db  = (b - zero_fields[i]).reshape(1, -1)
-                    f   = models[i]["model"].predict(db).flatten()
+                    f   = models[i]["model"].predict(db).flatten() - force_offsets[i]
                     lbls = models[i].get("axis_labels", ["Fx_N", "Fy_N", "Fz_N"])
+                    forces_per_sensor.append(f)
 
-                    row[f"Bx_s{sid}_mT"] = f"{b[0]:.6f}"
-                    row[f"By_s{sid}_mT"] = f"{b[1]:.6f}"
-                    row[f"Bz_s{sid}_mT"] = f"{b[2]:.6f}"
                     for lbl, val in zip(lbls, f):
                         row[f"{lbl}_s{sid}"] = f"{val:.6f}"
 
                 writer.writerow(row)
+
+                if display is not None:
+                    display.update(elapsed, forces_per_sensor)
+                    if display.stop_requested:
+                        break
 
                 if args.duration is not None and elapsed >= args.duration:
                     break
@@ -191,6 +319,8 @@ def main():
         print("\n# Stopped by user.", file=sys.stderr)
     finally:
         sensor.close()
+        if display is not None:
+            display.close()
         print(f"# Saved → {output.resolve()}", file=sys.stderr)
 
 
