@@ -20,9 +20,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
+from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures
 
@@ -38,11 +40,23 @@ _ATI_AXES = {
 _B_COLS = ["Bx_mT", "By_mT", "Bz_mT"]
 
 
-def build_model(degree: int) -> Pipeline:
-    return Pipeline([
-        ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
-        ("reg",  LinearRegression()),
-    ])
+def build_model(model_type: str, degree: int, random_state: int):
+    if model_type == "poly":
+        return Pipeline([
+            ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
+            ("reg",  LinearRegression()),
+        ])
+    elif model_type == "ridge":
+        return Pipeline([
+            ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
+            ("reg",  Ridge(alpha=1.0)),
+        ])
+    elif model_type == "random-forest":
+        return RandomForestRegressor(n_estimators=200, random_state=random_state, n_jobs=-1)
+    elif model_type == "gradient-boost":
+        return MultiOutputRegressor(HistGradientBoostingRegressor(random_state=random_state))
+    else:
+        raise ValueError(f"Unknown --model-type: {model_type}")
 
 
 def main():
@@ -52,8 +66,11 @@ def main():
     parser.add_argument("--output-axes", default="0,1,2",
                         help="ATI channel indices to predict, comma-separated. "
                              "0=Fx 1=Fy 2=Fz 3=Tx 4=Ty 5=Tz  (default: 0,1,2)")
-    parser.add_argument("--poly-degree", type=int, default=2,
-                        help="Polynomial feature degree (default 2)")
+    parser.add_argument("--model-type", default="poly",
+                        choices=["poly", "ridge", "random-forest", "gradient-boost"],
+                        help="Model type: poly (default), ridge, random-forest, gradient-boost")
+    parser.add_argument("--poly-degree", type=int, default=4,
+                        help="Polynomial degree — only used for poly and ridge (default 2)")
     parser.add_argument("--test-size", type=float, default=0.2,
                         help="Fraction held out for test evaluation (default 0.2)")
     parser.add_argument("--random-state", type=int, default=42)
@@ -151,11 +168,14 @@ def main():
     X_tr, X_te, Y_tr, Y_te = train_test_split(
         X, Y, test_size=args.test_size, random_state=args.random_state
     )
-    print(f"\nSplit: {len(X_tr)} train / {len(X_te)} test  "
-          f"(degree={args.poly_degree}, poly features="
-          f"{PolynomialFeatures(args.poly_degree, include_bias=False).fit(X[:1]).n_output_features_})")
+    if args.model_type in ("poly", "ridge"):
+        n_feat = PolynomialFeatures(args.poly_degree, include_bias=False).fit(X[:1]).n_output_features_
+        print(f"\nSplit: {len(X_tr)} train / {len(X_te)} test  "
+              f"(model={args.model_type}, degree={args.poly_degree}, poly features={n_feat})")
+    else:
+        print(f"\nSplit: {len(X_tr)} train / {len(X_te)} test  (model={args.model_type})")
 
-    model = build_model(args.poly_degree)
+    model = build_model(args.model_type, args.poly_degree, args.random_state)
     model.fit(X_tr, Y_tr)
 
     Y_pred_tr = model.predict(X_tr)
