@@ -5,7 +5,9 @@ import time
 import pandas as pd
 import matplotlib.pyplot as plt
 import threading
+import joblib
 from collections import deque
+from pathlib import Path
 
 stop_requested = False
 
@@ -32,13 +34,16 @@ class SensorReader:
         self.offsets = None
         self.calibrated = False
 
-        # Unified table: raw values + derivatives for both sensors
+        self.models = None       # list of fitted sklearn models, one per sensor
+        self.zero_fields = None  # list of np.ndarray (3,), one per sensor
+
+        # Unified table: raw B values + predicted forces for both sensors
         self.df = pd.DataFrame(columns=[
             'timestamp_ms',
-            'x1', 'y1', 'z1',
-            'x2', 'y2', 'z2',
-            'dx1', 'dy1', 'dz1',
-            'dx2', 'dy2', 'dz2',
+            'Bx_s1', 'By_s1', 'Bz_s1',
+            'Bx_s2', 'By_s2', 'Bz_s2',
+            'Fx_s1', 'Fy_s1', 'Fz_s1',
+            'Fx_s2', 'Fy_s2', 'Fz_s2',
         ])
 
         self._prev_ts   = None
@@ -103,72 +108,75 @@ class SensorReader:
             return None, None
         return time.time() * 1000.0, data
 
-    # ── Calibration ────────────────────────────────────────────────────────────
+    # ── Model loading ──────────────────────────────────────────────────────────
 
-    def calibrate(self, n_samples=10):
-        """Collect n_samples at rest and compute per-sensor zero offsets."""
-        print(f"\nStarting calibration with {n_samples} samples...")
-        print("Please ensure the sensors are not being touched!")
+    def load_models(self, model_paths):
+        """Load one calibration model per sensor from pkl files saved by 02_train_model.py."""
+        self.models = []
+        self.zero_fields = []
+        for i, path in enumerate(model_paths):
+            payload = joblib.load(Path(path))
+            self.models.append(payload["model"])
+            self.zero_fields.append(payload["zero_field"])
+            print(f"  Sensor {i+1}: loaded {Path(path).name}  "
+                  f"zero_field={payload['zero_field'].round(3)} mT")
+        self.offsets = np.stack(self.zero_fields)  # [n_sensors, 3] — used as zero baseline
+        self.calibrated = True
+
+    # ── Calibration (re-zero) ──────────────────────────────────────────────────
+
+    def calibrate(self, n_samples=100):
+        """Re-capture zero baseline at rest (overrides model zero_field)."""
+        print(f"\nRe-zeroing over {n_samples} samples — keep sensors unloaded…")
         samples, collected = [], 0
         while collected < n_samples:
             ts, data = self.read_line()
             if data is not None:
                 samples.append(data)
                 collected += 1
-                print(f"  Sample {collected}/{n_samples}")
-        # offsets shape: [2, 3]
         self.offsets = np.mean(np.stack(samples, axis=0), axis=0)
+        if self.zero_fields is not None:
+            self.zero_fields = [self.offsets[i] for i in range(self.n_sensors)]
         self.calibrated = True
-        print("\nCalibration complete!")
+        print("Re-zero complete!")
         for i in range(self.n_sensors):
-            print(f"  Sensor {i+1}: X={self.offsets[i,0]:.2f}  "
-                  f"Y={self.offsets[i,1]:.2f}  Z={self.offsets[i,2]:.2f}")
+            print(f"  Sensor {i+1}: {self.offsets[i].round(3)} mT")
 
     # ── Calibrated reading + derivative + logging ──────────────────────────────
 
     def read_and_log(self):
         """
-        Read latest line, apply calibration, compute finite-difference derivatives.
+        Read latest line, apply zero offset, predict forces if models are loaded.
         Appends a row to self.df.
 
-        Returns (timestamp_ms, calibrated_data[2,3], deriv[2,3] or None).
+        Returns (timestamp_ms, b_data[2,3], forces[2,3] or None).
         """
         timestamp, data = self.read_latest_line()
         if data is None:
             return None, None, None
 
         if not self.calibrated:
-            print("Warning: not calibrated yet — returning raw data.")
-        else:
-            data = data - self.offsets  # [2, 3]
+            print("Warning: not zeroed yet — returning raw data.")
 
-        deriv = None
-        if self._prev_ts is not None:
-            dt = timestamp - self._prev_ts
-            if dt > 0:
-                deriv = (data - self._prev_data) / dt  # [2, 3]
+        # Predict forces for each sensor
+        forces = np.zeros((self.n_sensors, 3))
+        if self.models is not None:
+            for i in range(self.n_sensors):
+                db = (data[i] - self.zero_fields[i]).reshape(1, -1)
+                forces[i] = self.models[i].predict(db).flatten()
 
         self._prev_ts   = timestamp
         self._prev_data = data
 
-        x1, y1, z1 = data[0]
-        x2, y2, z2 = data[1]
-
-        if deriv is not None:
-            dx1, dy1, dz1 = deriv[0]
-            dx2, dy2, dz2 = deriv[1]
-        else:
-            dx1 = dy1 = dz1 = dx2 = dy2 = dz2 = np.nan
-
         self.df.loc[len(self.df)] = [
             timestamp,
-            x1, y1, z1,
-            x2, y2, z2,
-            dx1, dy1, dz1,
-            dx2, dy2, dz2,
+            data[0, 0], data[0, 1], data[0, 2],
+            data[1, 0], data[1, 1], data[1, 2],
+            forces[0, 0], forces[0, 1], forces[0, 2],
+            forces[1, 0], forces[1, 1], forces[1, 2],
         ]
 
-        return timestamp, data, deriv
+        return timestamp, data, forces
 
     # ── Recording loops ────────────────────────────────────────────────────────
 
@@ -216,12 +224,10 @@ class RealtimePlotter:
 
         mk = lambda: deque(maxlen=max_points)
         self.t_buf   = mk()
-        self.mx_buf  = mk()   # mean X (with inversion)
-        self.my_buf  = mk()   # mean Y
-        self.mz_buf  = mk()   # mean Z
-        self.mdx_buf = mk()   # mean |dX/dt|
-        self.mdy_buf = mk()   # mean |dY/dt|
-        self.mdz_buf = mk()   # mean |dZ/dt|
+        self.mx_buf  = mk()   # Fz sensor 1
+        self.my_buf  = mk()   # Fz sensor 2
+        self.mz_buf  = mk()   # Fx mean
+        self.mdx_buf = mk()   # Fy mean
 
         plt.ion()
         self.fig, (self.ax_force, self.ax_deriv) = plt.subplots(
@@ -231,25 +237,24 @@ class RealtimePlotter:
                            fontsize=13, fontweight='bold')
         self.fig.canvas.mpl_connect('close_event', self._on_close)
 
-        # ── Top: mean force ────────────────────────────────────────────────────
-        self.line_x, = self.ax_force.plot([], [], color='r', linewidth=1.5, label='|mean X|')
-        self.line_y, = self.ax_force.plot([], [], color='g', linewidth=1.5, label='|mean Y|')
-        self.line_z, = self.ax_force.plot([], [], color='b', linewidth=1.5, label='|mean Z|')
-        self.ax_force.set_title("Mean |Force| across sensors  (X: sensor 1 inverted)",
-                                fontsize=10)
-        self.ax_force.set_ylabel("|Force| (units)")
-        self.ax_force.set_ylim(0, 15)        # ← adjust
+        # ── Top: Fz per sensor ────────────────────────────────────────────────
+        self.line_fz1, = self.ax_force.plot([], [], color='b', linewidth=1.5, label='Fz sensor 1')
+        self.line_fz2, = self.ax_force.plot([], [], color='r', linewidth=1.5, label='Fz sensor 2')
+        self.ax_force.set_title("Normal force Fz per sensor", fontsize=10)
+        self.ax_force.set_ylabel("Fz (N)")
+        self.ax_force.set_ylim(-2, 20)
+        self.ax_force.axhline(0, color='k', linewidth=0.5)
         self.ax_force.legend(loc='upper right')
         self.ax_force.grid(True, alpha=0.3)
 
-        # ── Bottom: mean derivative ────────────────────────────────────────────
-        self.line_dx, = self.ax_deriv.plot([], [], color='r', linewidth=1.5, label='|mean dX/dt|')
-        self.line_dy, = self.ax_deriv.plot([], [], color='g', linewidth=1.5, label='|mean dY/dt|')
-        self.line_dz, = self.ax_deriv.plot([], [], color='b', linewidth=1.5, label='|mean dZ/dt|')
-        self.ax_deriv.set_title("Mean |Derivative| across sensors", fontsize=10)
+        # ── Bottom: Fx and Fy mean ─────────────────────────────────────────────
+        self.line_fx, = self.ax_deriv.plot([], [], color='g', linewidth=1.5, label='Fx mean')
+        self.line_fy, = self.ax_deriv.plot([], [], color='m', linewidth=1.5, label='Fy mean')
+        self.ax_deriv.set_title("Shear forces Fx / Fy (mean across sensors)", fontsize=10)
         self.ax_deriv.set_xlabel("Time (ms)")
-        self.ax_deriv.set_ylabel("dV/dt (units/ms)")
-        self.ax_deriv.set_ylim(0, 0.2)      # ← adjust
+        self.ax_deriv.set_ylabel("F (N)")
+        self.ax_deriv.set_ylim(-10, 10)
+        self.ax_deriv.axhline(0, color='k', linewidth=0.5)
         self.ax_deriv.legend(loc='upper right')
         self.ax_deriv.grid(True, alpha=0.3)
 
@@ -263,44 +268,28 @@ class RealtimePlotter:
 
     def _read_all_pending(self):
         while self.reader.serial_conn.in_waiting > 0:
-            timestamp, data, deriv = self.reader.read_and_log()
+            timestamp, data, forces = self.reader.read_and_log()
 
-            if data is not None:
-                # Invert sensor 1 X before averaging (flip if needed)
-                x_mean = abs((-data[0, 0] + data[1, 0]) / 2)
-                y_mean = abs((data[0, 1]  + data[1, 1]) / 2)
-                z_mean = abs((data[0, 2]  + data[1, 2]) / 2)
+            if data is not None and forces is not None:
                 self.t_buf.append(timestamp)
-                self.mx_buf.append(x_mean)
-                self.my_buf.append(y_mean)
-                self.mz_buf.append(z_mean)
-
-            if deriv is not None:
-                dx_mean = (abs(deriv[0, 0]) + abs(deriv[1, 0])) / 2
-                dy_mean = (abs(deriv[0, 1]) + abs(deriv[1, 1])) / 2
-                dz_mean = (abs(deriv[0, 2]) + abs(deriv[1, 2])) / 2
-                self.mdx_buf.append(dx_mean)
-                self.mdy_buf.append(dy_mean)
-                self.mdz_buf.append(dz_mean)
+                self.mx_buf.append(forces[0, 2])               # Fz sensor 1
+                self.my_buf.append(forces[1, 2])               # Fz sensor 2
+                self.mz_buf.append((forces[0, 0] + forces[1, 0]) / 2)   # Fx mean
+                self.mdx_buf.append((forces[0, 1] + forces[1, 1]) / 2)  # Fy mean
 
     def _redraw(self):
         if not self._window_open:
             return
         try:
-            t = self.t_buf
-
-            self.line_x.set_data(t, self.mx_buf)
-            self.line_y.set_data(t, self.my_buf)
-            self.line_z.set_data(t, self.mz_buf)
-
-            n = min(len(t), len(self.mdx_buf))
-            t_trunc = list(t)[-n:]
-            self.line_dx.set_data(t_trunc, self.mdx_buf)
-            self.line_dy.set_data(t_trunc, self.mdy_buf)
-            self.line_dz.set_data(t_trunc, self.mdz_buf)
+            t = list(self.t_buf)
+            self.line_fz1.set_data(t, list(self.mx_buf))
+            self.line_fz2.set_data(t, list(self.my_buf))
+            self.line_fx.set_data(t, list(self.mz_buf))
+            self.line_fy.set_data(t, list(self.mdx_buf))
 
             if len(t) > 1:
                 self.ax_force.set_xlim(min(t), max(t))
+                self.ax_deriv.set_xlim(min(t), max(t))
 
             self.fig.canvas.flush_events()
         except Exception:
@@ -336,6 +325,9 @@ if __name__ == "__main__":
 
     LIVE_PLOT = True
 
+    MODEL_S1 = "model_s1.pkl"   # ← path to sensor 1 model
+    MODEL_S2 = "model_s2.pkl"   # ← path to sensor 2 model
+
     PORT = 'COM10'
     reader = SensorReader(port=PORT, baudrate=115200, n_sensors=2)
 
@@ -344,7 +336,11 @@ if __name__ == "__main__":
         exit(1)
 
     try:
-        reader.calibrate(n_samples=10)
+        print("Loading models…")
+        reader.load_models([MODEL_S1, MODEL_S2])
+        print("\nKeep sensors unloaded and press Enter to re-zero…")
+        input()
+        reader.calibrate(n_samples=100)
         print("Move / press the sensors now.")
 
         keyboard_thread = threading.Thread(target=wait_for_stop_key, daemon=True)
