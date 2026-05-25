@@ -99,14 +99,15 @@ class FrankaEnvParallel:
 
     # Action scaling constants
     Z_VEL_MAX       = 0.85
-    Z_ACC_MAX       = 60.0   # m/s² — hard limit on target-velocity rate of change
+    Z_ACC_MAX       = 20.75   # m/s² — hard limit on target-velocity rate of change
     Z_ACC_PENALTY_THRESHOLD = 13.0
-    Z_ACC_PENALTY_WEIGHT    = 0.25
+    Z_ACC_PENALTY_WEIGHT    = 0.0
     EE_Z_TARGET     = 0.7
     GRIPPER_CLOSED  = 0.000251
     GRIPPER_OPEN    = 0.0124
-    # Tracking normalization: value of 20*exp(-30*z_error) at z_error=0.001 m
-    TRACKING_PERFECT = 20.0 * math.exp(-30.0 * 0.001)  # ≈ 19.41
+    # Release-to-regrasp detection
+    REGRASP_FORCE_THRESHOLD = 0.5  # N: avg finger force below this → released, above → grasped
+    REGRASP_BONUS           = 75.0  # fixed reward per successful regrasp event (max 3 per episode)
 
     def __init__(
         self,
@@ -129,7 +130,7 @@ class FrankaEnvParallel:
         self.target_update_every = max(1, int(round(target_dt / dt)))
         self.target_period = self.target_update_every * dt
         self.num_actions = 3
-        self.max_episode_length = 120
+        self.max_episode_length = 450
         self.extras: dict = {}
         self.cfg = {
             "num_envs": num_envs,
@@ -247,9 +248,11 @@ class FrankaEnvParallel:
             self.obs_buf = torch.zeros(N, self.OBS_DIM, device=self.device)
             self.rew_buf = torch.zeros(N, device=self.device)
             self.reset_buf = torch.zeros(N, dtype=torch.bool, device=self.device)
-            self.initial_z_error = torch.ones(N, device=self.device)
-            self.initial_tracking = torch.zeros(N, device=self.device)
             self.direction_change_count = torch.zeros(N, dtype=torch.long, device=self.device)
+            self.last_reward_terms = {}
+            # Release-to-regrasp tracking
+            self._in_release = torch.zeros(N, dtype=torch.bool, device=self.device)
+            self._regrasp_count = torch.zeros(N, dtype=torch.long, device=self.device)
             # Cubic-hermite segment state per env
             self._seg_start = None   # (N, 3): (z, z_vel, z_acc)
             self._seg_end = None     # (N, 3)
@@ -277,7 +280,8 @@ class FrankaEnvParallel:
         #                     torch.ones(_n, device=self.device),
         #                     -torch.ones(_n, device=self.device))
         _sign = torch.ones(_n, device=self.device)
-        self.desired_rel_z[envs_idx] = _sign * (0.025 + torch.rand(_n, device=self.device) * 0.02)
+        # self.desired_rel_z[envs_idx] = _sign * (0.025 + torch.rand(_n, device=self.device) * 0.02)
+        self.desired_rel_z[envs_idx] =  0.035
         self.episode_length_buf[envs_idx] = 0
 
         self._seg_start = None
@@ -286,7 +290,6 @@ class FrankaEnvParallel:
 
         self.sim_step = 0
 
-        self._store_initial_z_error(envs_idx)
         self._update_obs_buf()
         return self.get_observations()
 
@@ -402,6 +405,11 @@ class FrankaEnvParallel:
         finger_mid = (left_ft + right_ft) / 2.0                    # (N, 3)
         fingertip_dist = (left_ft - right_ft).norm(dim=-1)          # (N,)
 
+        link_forces = self.franka.get_links_net_contact_force()     # (N, n_links, 3)
+        left_force_mag  = link_forces[:, self.left_finger.idx_local,  :].norm(dim=-1)  # (N,)
+        right_force_mag = link_forces[:, self.right_finger.idx_local, :].norm(dim=-1)  # (N,)
+        avg_finger_force = (left_force_mag + right_force_mag) * 0.5  # (N,)
+
         cuboid_rel_z = cuboid_pos[:, 2] - finger_mid[:, 2]          # (N,)
         cuboid_rel_x = cuboid_pos[:, 0] - finger_mid[:, 0]          # (N,)
         cuboid_rel_y = cuboid_pos[:, 1] - finger_mid[:, 1]          # (N,)
@@ -412,75 +420,105 @@ class FrankaEnvParallel:
         timeout = self.episode_length_buf >= self.max_episode_length  # (N,)
         success = (~timeout) & (
             ((cuboid_rel_z - self.desired_rel_z).abs() <= 0.01)
-            & (ee_vel_z.abs() < 0.01)
+            & (ee_vel_z.abs() < 0.02)
             # & (ee_z < 0.86)
         )
         fail = (
-            (cuboid_rel_x.abs() > 0.015)                            # relaxed: 15 mm
-            | (cuboid_rel_y.abs() > 0.015)                          # relaxed: 15 mm
-            | (fingertip_dist < 0.02)
+            (cuboid_rel_x.abs() > 0.04)                             # 4 cm lateral tolerance
+            | (cuboid_rel_y.abs() > 0.04)                           # 4 cm lateral tolerance
+            | (fingertip_dist < 0.01)
             | (cuboid_rel_z.abs() > 0.15)
-            | (ee_z < 0.76)                                         # ee too low
+            | (ee_z < 0.6)                                         # ee too low
             | (ee_z > 0.96)                                         # ee too high
+            
         )
+        # if (cuboid_rel_z - self.desired_rel_z).abs().max() <= 0.01:
+        #     print(f" maybe success:  velocity is {ee_vel_z.abs()} ")
+        # print(f" why failed: "
+        #       f"cuboid_rel_x={cuboid_rel_x.mean().item():+.4f}  "
+        #       f"cuboid_rel_y={cuboid_rel_y.mean().item():+.4f}  "
+        #       f"fingertip_dist={fingertip_dist.mean().item():.4f}  "
+        #       f"cuboid_rel_z={cuboid_rel_z.mean().item():+.4f}  "
+        #       f"ee_z={ee_z.mean().item():.4f}  "
+        #       f"ee_vel_z={ee_vel_z.mean().item():+.4f}  "
+        #       f"timeout={timeout.float().mean().item():.2f}  "
+        #       f"success={success.float().mean().item():.2f}  "
+        #       f"fail={fail.float().mean().item():.2f}"
+        # )
         done = timeout | success | fail
 
-        # ---- dense tracking: normalized linearly from 0 (episode start) to 1 (z_error=0.001) ----
+        # ---- Z-axis tracking: always non-zero gradient, max 5.0/step ----
+        # Using raw exponential (no normalization) so agent always gets signal,
+        # including when moving away from goal (no reward-cliff at start).
         z_error = (cuboid_rel_z - self.desired_rel_z).abs()         # (N,)
-        tracking_raw = 20.0 * torch.exp(-30.0 * z_error)            # (0, 20]
-        denom = (self.TRACKING_PERFECT - self.initial_tracking).clamp(min=1e-6)  # (N,)
-        tracking = ((tracking_raw - self.initial_tracking) / denom).clamp(0.0, 1.0)  # [0, 1]
-        # print(f"z_error={z_error.mean().item():.4f}  tracking={tracking.mean().item():.2f}")
+        z_track = 5.0 * torch.exp(-25.0 * z_error)
+        # At z_error=0.035 (typical start): ~2.09  → at goal: 5.0
 
-        # ---- jerk penalty: quadratic, normalized by Z_VEL_MAX ----
+        # ---- Lateral centering: soft penalty prevents early drift failures ----
+        lateral_err = (cuboid_rel_x.pow(2) + cuboid_rel_y.pow(2)).sqrt()  # (N,)
+        centering = -2.0 * torch.tanh(lateral_err / 0.02)
+        # 0 when centered; ≈ -1.0 at 1.4 cm; saturates at -2.0
+
+        # ---- Grip quality via contact force (not fingertip distance) ----
+        # Rewards the agent for maintaining firm contact with the object.
+        avg_force = (left_force_mag + right_force_mag) * 0.5        # (N,)
+        grip_force_reward = 2.0 * torch.tanh(avg_force / 3.0)       # max 2.0
+
+        # ---- Smooth motion penalty ----
         jerk = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
-        jerk_penalty = -0.2 * jerk.pow(2)                           # [-1.2, 0]
+        jerk_penalty = -0.2 * jerk.pow(2)
 
-        # ---- commanded z acceleration penalty: linear above threshold ----
-        commanded_z_acc = (self.target_z_vel - self.prev_target_z_vel) / self.target_period  # (N,)
+        # ---- Commanded z acceleration penalty ----
+        commanded_z_acc = (self.target_z_vel - self.prev_target_z_vel) / self.target_period
         z_acc_excess = (commanded_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).clamp(min=0.0)
-        z_acc_penalty = -self.Z_ACC_PENALTY_WEIGHT * z_acc_excess
-        # direction_changed = (
-        #     ((self.prev_target_z_vel > 0.0) & (self.target_z_vel < 0.0))
-        #     | ((self.prev_target_z_vel < 0.0) & (self.target_z_vel > 0.0))
-        # )
-        # self.direction_change_count += direction_changed.long()
-        # direction_change_penalty = -10.0 * direction_changed.float()
+        z_acc_penalty = (-self.Z_ACC_PENALTY_WEIGHT * z_acc_excess) / 8.0
 
-        # ---- grip quality: reward keeping fingertips around box ----
-        grip = torch.exp(-200.0 * (fingertip_dist - 0.03).clamp(min=0.0))  # (0, 1]
+        # ---- EE height guidance: penalise arm drifting too high ----
+        ee_z_penalty = -0.35 * torch.clamp(ee_z - 0.86, min=0.0)
 
-        # ---- terminal / alive base reward ----
-        ep = self.episode_length_buf.float()                        # (N,)
-        base_reward = torch.where(success,
-                                  +500.0 - ep * 0.1,
-                                  torch.where(fail | timeout,
-                                              -250.0,
-                                              torch.full_like(ee_z, -0.15)))
+        # ---- Regrasp bonus (simplified: fixed reward per event, max 3/episode) ----
+        currently_grasped = avg_force >= self.REGRASP_FORCE_THRESHOLD
+        regrasp_event = self._in_release & currently_grasped        # was released → now grasped
+        eligible_regrasp = regrasp_event & (self._regrasp_count < 3)
+        regrasp_bonus = self.REGRASP_BONUS * eligible_regrasp.float()
+        self._regrasp_count += regrasp_event.long()
+        self._in_release = (~currently_grasped).clone()
 
-        # ---- ee_z height penalty: push arm toward target height from both sides ----
-        ee_z_penalty = -0.35 * (ee_z - self.EE_Z_TARGET).abs()
+        # ---- Terminal / alive base reward ----
+        # Dense max over full episode: ~(5+2) * 120 = 840.
+        # Success +800 strongly rewards early completion; regrasp 75×3=225 incentivises the key maneuver.
+        ep = self.episode_length_buf.float()
+        base_reward = torch.where(
+            success,
+            +800.0 - ep * 2.0,
+            torch.where(
+                fail | timeout,
+                torch.full_like(ee_z, -75.0),
+                torch.full_like(ee_z, -0.05),  # small alive penalty per step
+            ),
+        )
+
+        self.last_reward_terms = {
+            "z_track": z_track.detach().clone(),
+            "centering": centering.detach().clone(),
+            "grip_force": grip_force_reward.detach().clone(),
+            "jerk_penalty": jerk_penalty.detach().clone(),
+            "z_acc_penalty": z_acc_penalty.detach().clone(),
+            "ee_z_penalty": ee_z_penalty.detach().clone(),
+            "regrasp_bonus": regrasp_bonus.detach().clone(),
+        }
 
         reward = (
             base_reward
-            + 3.0 * tracking
+            + z_track
+            + centering
+            + grip_force_reward
             + jerk_penalty
             + z_acc_penalty
-            + 0.5 * grip
             + ee_z_penalty
+            + regrasp_bonus
         )
         return done, reward, timeout
-
-    def _store_initial_z_error(self, envs_idx: torch.Tensor):
-        """Snapshot |cuboid_rel_z - desired_rel_z| at episode start for normalization."""
-        cuboid_pos = self.cuboid.get_pos()
-        left_ft  = self._fingertip_pos(self.left_finger)
-        right_ft = self._fingertip_pos(self.right_finger)
-        finger_mid = (left_ft + right_ft) / 2.0
-        cuboid_rel_z = cuboid_pos[:, 2] - finger_mid[:, 2]
-        err = (cuboid_rel_z[envs_idx] - self.desired_rel_z[envs_idx]).abs()
-        self.initial_z_error[envs_idx] = err.clamp(min=1e-3)
-        self.initial_tracking[envs_idx] = 20.0 * torch.exp(-30.0 * self.initial_z_error[envs_idx])
 
     def _reset_idx(self, envs_idx: torch.Tensor):
         """Reset a subset of envs in-place; sim_step continues uninterrupted."""
@@ -503,9 +541,11 @@ class FrankaEnvParallel:
         #                     torch.ones(_n, device=self.device),
         #                     -torch.ones(_n, device=self.device))
         _sign = torch.ones(_n, device=self.device)
-        self.desired_rel_z[envs_idx] = _sign * (0.025 + torch.rand(_n, device=self.device) * 0.02)
+        # self.desired_rel_z[envs_idx] = _sign * (0.025 + torch.rand(_n, device=self.device) * 0.02)
+        self.desired_rel_z[envs_idx] =  0.035
         self.episode_length_buf[envs_idx] = 0
-        self._store_initial_z_error(envs_idx)
+        self._in_release[envs_idx] = False
+        self._regrasp_count[envs_idx] = 0
 
     # ------------------------------------------------------------------ #
     # Internal: controller                                                #
